@@ -1,7 +1,7 @@
 'use strict';
 
 // 启动初始化：幂等建表 + 首次启动播种账号与示例草稿。
-const { db, getMeta, setMeta } = require('./db');
+const { db, getMeta, setMeta, writeTransaction } = require('./db');
 const { hashPassword } = require('./auth');
 const { timeToMin } = require('./scheduling');
 
@@ -41,30 +41,29 @@ const SEED_CUES = [
 ];
 
 function seedUsers() {
+  // INSERT OR IGNORE + 单条写锁事务：两个实例同时冷启动时，重复账号由唯一约束吞掉，
+  // 不出现「检查不存在 → 双双插入 → 其一 UNIQUE 崩溃」的竞争
   const insert = db.prepare(
-    `INSERT INTO users(username, display_name, password_hash, role, position)
+    `INSERT OR IGNORE INTO users(username, display_name, password_hash, role, position)
      VALUES (@username, @display_name, @password_hash, @role, @position)`
   );
-  let count = 0;
-  for (const u of DEFAULT_USERS) {
-    const exists = db.prepare('SELECT 1 FROM users WHERE username = ?').get(u.username);
-    if (exists) continue;
-    insert.run({
-      username: u.username,
-      display_name: u.display_name,
-      password_hash: hashPassword(u.password),
-      role: u.role,
-      position: u.position,
-    });
-    count += 1;
-  }
-  return count;
+  const runAll = writeTransaction(() => {
+    let count = 0;
+    for (const u of DEFAULT_USERS) {
+      count += insert.run({
+        username: u.username,
+        display_name: u.display_name,
+        password_hash: hashPassword(u.password),
+        role: u.role,
+        position: u.position,
+      }).changes;
+    }
+    return count;
+  });
+  return runAll;
 }
 
 function seedDraft() {
-  const cueCount = db.prepare('SELECT COUNT(*) AS n FROM draft_cues').get().n;
-  if (cueCount > 0) return false;
-
   const insertCue = db.prepare(
     `INSERT INTO draft_cues(code, title, position, planned_start, duration)
      VALUES (@code, @title, @position, @planned_start, @duration)`
@@ -79,49 +78,57 @@ function seedDraft() {
     'INSERT INTO draft_cue_resources(cue_id, resource_id, usage) VALUES (?, ?, ?)'
   );
 
-  const tx = db.transaction((cues) => {
-    const codeToId = new Map();
-    for (const c of cues) {
-      const info = insertCue.run({
-        code: c.code,
-        title: c.title,
-        position: c.position,
-        planned_start: timeToMin(c.start),
-        duration: c.duration,
-      });
-      codeToId.set(c.code, info.lastInsertRowid);
+  // 调用方须已在写锁事务内并确认草稿为空（多实例冷启动时只有一个实例实际播种）
+  const codeToId = new Map();
+  for (const c of SEED_CUES) {
+    const info = insertCue.run({
+      code: c.code,
+      title: c.title,
+      position: c.position,
+      planned_start: timeToMin(c.start),
+      duration: c.duration,
+    });
+    codeToId.set(c.code, info.lastInsertRowid);
+  }
+  for (const c of SEED_CUES) {
+    for (const pre of c.deps || []) {
+      insertDep.run(codeToId.get(pre), codeToId.get(c.code));
     }
-    for (const c of cues) {
-      for (const pre of c.deps || []) {
-        insertDep.run(codeToId.get(pre), codeToId.get(c.code));
-      }
+  }
+  const resNameToId = new Map();
+  for (const r of SEED_RESOURCES) {
+    const info = insertResource.run(r.name, r.capacity);
+    resNameToId.set(r.name, info.lastInsertRowid);
+  }
+  for (const [code, usages] of Object.entries(SEED_CUE_RESOURCES)) {
+    for (const u of usages) {
+      insertCueResource.run(codeToId.get(code), resNameToId.get(u.resource), u.usage);
     }
-    const resNameToId = new Map();
-    for (const r of SEED_RESOURCES) {
-      const info = insertResource.run(r.name, r.capacity);
-      resNameToId.set(r.name, info.lastInsertRowid);
-    }
-    for (const [code, usages] of Object.entries(SEED_CUE_RESOURCES)) {
-      for (const u of usages) {
-        insertCueResource.run(codeToId.get(code), resNameToId.get(u.resource), u.usage);
-      }
-    }
-  });
-  tx(SEED_CUES);
+  }
   return true;
 }
 
 function init() {
-  if (getMeta('initialized') !== '1') {
+  // 首次初始化整体置于一个写锁事务：两个实例同时冷启动时，后到者在 busy_timeout 内等待，
+  // 看到 initialized=1 后直接跳过，不会重复播种账号 / 草稿，也不会因唯一约束启动失败。
+  const firstRun = getMeta('initialized') !== '1';
+  if (!firstRun) {
+    seedUsers(); // 补齐升级后新增的默认账号（内部为幂等写事务）
+    return { firstRun: false, seededUsers: 0, seededDraft: false };
+  }
+  return writeTransaction(() => {
+    if (getMeta('initialized') === '1') {
+      // 等待写锁期间另一实例已完成播种
+      return { firstRun: false, seededUsers: 0, seededDraft: false };
+    }
     const seededUsers = seedUsers();
-    const seededDraft = seedDraft();
+    const cueCount = db.prepare('SELECT COUNT(*) AS n FROM draft_cues').get().n;
+    const seededDraft = cueCount === 0 ? seedDraft() : false;
     if (getMeta('positions') === null) setMeta('positions', JSON.stringify(SEED_POSITIONS));
     setMeta('draft_version', getMeta('draft_version', '0'));
     setMeta('initialized', '1');
     return { firstRun: true, seededUsers, seededDraft };
-  }
-  seedUsers(); // 补齐升级后新增的默认账号
-  return { firstRun: false, seededUsers: 0, seededDraft: false };
+  });
 }
 
 if (require.main === module) {

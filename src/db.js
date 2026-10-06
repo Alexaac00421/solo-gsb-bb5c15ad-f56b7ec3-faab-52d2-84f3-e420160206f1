@@ -12,6 +12,9 @@ fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
+// 多实例共用同一数据库时，写事务（BEGIN IMMEDIATE）在另一实例持写锁期间等待而非立刻
+// SQLITE_BUSY；现场写事务均为毫秒级，10 秒足以让交错操作串行化后按最新已提交状态复核。
+db.pragma('busy_timeout = 10000');
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
@@ -300,4 +303,9 @@ function setMeta(key, value) {
   ).run(key, String(value));
 }
 
-module.exports = { db, getMeta, setMeta, DB_PATH };
+module.exports = {
+  db, getMeta, setMeta, DB_PATH,
+  // 立即取得写锁的事务：多实例冷启动/现场写入交错时，写操作在 busy_timeout 内排队
+  // 串行执行，避免「检查通过后插入被另一实例抢先」类竞争
+  writeTransaction: (fn) => db.transaction(fn).immediate(),
+};

@@ -274,6 +274,7 @@ npm start
 - **现场顺延预演（只读）在单次事务内同时核对所见执行版与全部提示项登记行版本**：请求必须携带 `versionId` 与 `rows: [{cueRef, rowVersion}]`（全部提示项，一项不能少）；版本已归档、行集合与当前版本不一致、或任一登记行版本已推进，均以 409 `WHATIF_STALE` 整体拒绝并逐项给出当前行版本，不会返回基于混合时点的预演结果；预演不推进任何版本号、不写入数据，可对同一快照反复试算。
 - **放行签认以「目标 + 直接前置项登记行版本快照」为一致性基准**：签认提交校验目标登记行版本（过期 409 `VERSION_CONFLICT`）；签认本身**不推进登记行版本**，因此两类签认可先后基于同一行版本完成。此后目标或任一直接前置项的登记行版本推进（岗位登记、舞监更正、跳过）即令相关签认失效；开始提交在同一事务内复核当前执行版、行版本、权限与两类签认有效性，缺签或失效以 409 `SIGNOFF_MISSING` 整体拒绝，不写入部分结果。
 - **预计结束倒挂不推进任何版本号（本轮新增）**：倒挂是重算时的只读判定（原预计结束 < 重算开始），**不修改登记、不推进行版本、不留更正痕迹**；仅在现场负载每行新增 `estimatedEndStale`（原预计结束已过期）与 `schedEndProvisional`（重算结束为暂算值）两个布尔标记。执行人才是唯一解除动作：重新填报**不早于提交时重算开始**的预计结束（同一事务校验，非法整体拒绝，不留登记与顺延确认痕），行版本随新登记正常 +1。
+- **多实例共用同一数据库时的写入一致性（本轮新增）**：岗位登记、舞监更正、依赖链跳过、停排、恢复（及发布、签认、代班、待确认确认、复盘封存）统一以 **`BEGIN IMMEDIATE` 立即写锁事务**执行——事务内完成「当前执行版 / 权限 / 所见行版本」复核、全部写入（登记、更正历史、签认失效、顺延待确认记录、停排记录）与**成功回执的版本视图 + 资源告警组装**。两个实例操作交错时，后到事务在写锁上排队（`busy_timeout=10s`），待前者提交后基于已提交结果继续：过期操作按既有冲突语义 409 拒绝，成功回执只反映本次提交后的状态，后续操作的排期不会混入前一回执；任一校验失败整体回滚，不留登记、更正历史、签认失效或待确认记录。冷启动播种同样在写锁事务内幂等完成，两实例同时启动不会因竞争播种而崩溃。
 
 ## 五、配置项（环境变量）
 
@@ -1727,3 +1728,132 @@ curl -b sm.jar -X POST http://localhost:3000/api/live/whatif \
 - **已发布计划**：倒挂与重报都不改 `published_cues`；舞监更正仍按既有校验（保留的预计结束不得早于实际开始，无实际开始则为原计划开始），若更正后再次倒挂，现场同样按暂算口径标出。
 - **停排**：停排仍清除全部未开始项预计结束；恢复后无预计结束即按重算开始 + 时长推算，不会出现倒挂标记。
 - **页面**：现场页与历史回看页对倒挂行显示划线的旧预计结束 +「已过期」、重算结束列「⏱ 暂算结束」；本岗位倒挂行的登记按钮变为「重报预计」并预填暂算结束时刻；非法重报沿现有错误红条提示，不刷新掉其他操作结果。
+
+## 十九、多实例并发调用示例（本轮新增）
+
+联排提示板支持**两个（或更多）服务实例共用同一 SQLite 数据库（WAL）**水平部署。现场写入链路（岗位登记、舞监更正、依赖链跳过、停排、恢复，以及发布、签认、代班、待确认确认、复盘封存）满足：
+
+1. **写锁先行、复核与写入同事务**：写接口统一以 `BEGIN IMMEDIATE` 开始，进入事务即持有写锁；「当前执行版、权限（含代班）、所见登记行版本 / 记录版本」复核与全部写入、历史留痕在同一事务内，任一失败整体回滚——不留下登记、更正历史、签认失效或顺延待确认记录。
+2. **回执即本次提交**：成功响应里的版本视图（`version`：排期、岗位冲突、签认状态、停排状态）与 `resourceAlerts` 在**事务提交前**于同一写事务内组装，严格对应本次提交；即使另一实例随后立刻提交，其排期变化也不会出现在前一回执中。
+3. **交错操作按既有冲突语义拒绝过期方**：后到事务在写锁上等待（`busy_timeout=10s`），待前一事务提交后读取最新已提交状态继续执行；持旧行版本 / 旧执行版 / 旧记录版本的一方仍收到原有的 `409 VERSION_CONFLICT / VERSION_ARCHIVED / VERSION_STALE / NOTICE_STALE / …`，字段与错误码不变。
+4. **读不混时点**：`GET /api/live`、`GET /api/versions/:id` 在同一只读快照事务内组装整条版本视图；历史版仍只读，顺延预演仍不写库。
+5. **冷启动安全**：两实例首次同时启动时，建表与默认账号 / 示例草稿播种在写锁事务内幂等完成，不会因竞争播种而启动失败。
+
+### 0. 部署两个实例共用同一数据库
+
+```bash
+# 两个进程（或两个容器挂载同一数据卷），仅端口不同
+DATA_DIR=/app/data PORT=3001 node src/server.js   # 实例 A
+DATA_DIR=/app/data PORT=3002 node src/server.js   # 实例 B
+```
+
+> 注意：默认会话存储是各进程内存级（MemoryStore），负载均衡下需让同一账号的请求带各自实例登录的 Cookie，或生产环境改用共享会话存储；以下示例同一账号分别向两个实例登录。并发一致性只依赖数据库，与会话存储无关。
+
+### 1. 同一提示项并发登记：一成一冲突（回执不含失败方时刻）
+
+```bash
+# light 分别登录 A、B（保存各自 Cookie）
+curl -c a.jar -X POST http://localhost:3001/api/login -H 'Content-Type: application/json' \
+  -d '{"username":"light","password":"light123"}'
+curl -c b.jar -X POST http://localhost:3002/api/login -H 'Content-Type: application/json' \
+  -d '{"username":"light","password":"light123"}'
+
+# 取当前执行版与 L1 的 cueRef/rowVer（均为 1）
+curl -b a.jar http://localhost:3001/api/live
+
+# 两个实例同时提交 L1 的实际开始，时刻不同、行版本相同（1）
+curl -b a.jar -X POST http://localhost:3001/api/registrations -H 'Content-Type: application/json' \
+  -d '{"versionId":1,"cueRef":1,"rowVersion":1,"action":"start","time":"19:00"}' &
+curl -b b.jar -X POST http://localhost:3002/api/registrations -H 'Content-Type: application/json' \
+  -d '{"versionId":1,"cueRef":1,"rowVersion":1,"action":"start","time":"19:01"}' &
+wait
+```
+
+结果（先后顺序可能互换）：
+
+```text
+# 先取得写锁的一方：
+HTTP 200  version.cues[L1].actualStartText="19:00"  rowVer=2  status="RUNNING"
+# 排队后基于已提交状态复核的一方：
+HTTP 409  {"error":"VERSION_CONFLICT",
+           "message":"「L1」登记已被更新：当前行版本 2，提交基于 1，请刷新后重试",
+           "currentRowVersion":2}
+```
+
+成功回执中 L1 只可能是 `19:00`（提交方自己的时刻），绝不会出现失败方的 `19:01`；失败事务回滚，不产生登记、不推进版本、不留顺延待确认记录。
+
+### 2. 停排与同一时刻的开始登记并发：只可能有一个结果且自洽
+
+```bash
+# 舞监登录 A，道具登录 B
+curl -c sm.jar   -X POST http://localhost:3001/api/login -H 'Content-Type: application/json' -d '{"username":"sm","password":"sm12345"}'
+curl -c prop.jar -X POST http://localhost:3002/api/login -H 'Content-Type: application/json' -d '{"username":"props","password":"props123"}'
+
+curl -b sm.jar   -X POST http://localhost:3001/api/live/interruptions      -H 'Content-Type: application/json' \
+  -d '{"versionId":1,"pauseText":"19:05","reason":"设备故障"}' &
+curl -b prop.jar -X POST http://localhost:3002/api/registrations          -H 'Content-Type: application/json' \
+  -d '{"versionId":1,"cueRef":3,"rowVersion":1,"action":"start","time":"19:05"}' &
+wait
+```
+
+两种自洽结局（错误码均为既有码）：
+
+- **停排先提交**：停排 `201`（回执 `version.activeInterruption.pauseText="19:05"`）；登记排队后复核见停排进行中 → `409 INTERRUPTION_ACTIVE`，P1 无登记写入。
+- **登记先提交**：登记 `200`（P1 实际开始 19:05）；停排排队后复核时刻覆盖已登记实际时刻 → `400 INTERRUPTION_TIME_CONFLICT`，不留任何停排记录。
+
+恢复与停排期间登记的并发同理：恢复 `200` + 登记 `409 INTERRUPTION_ACTIVE`；若恢复先提交，登记随后基于已恢复状态按正常规则处理。
+
+### 3. 跳过链与舞监更正并发：链中任一行版本变化，整链拒绝不留痕
+
+```bash
+# 舞监在 A 预览以 S1（cueRef=2）为根的链：S1 → S2/L2 → L3
+curl -b sm.jar "http://localhost:3001/api/live/skips/preview?versionId=1&cueRef=2"
+# 取 chain: [{cueRef,rowVersion}, ...]
+
+# A 确认跳过整链，B 同时持预览时 L3 的旧 rowVersion 更正
+curl -b sm.jar -X POST http://localhost:3001/api/live/skips -H 'Content-Type: application/json' \
+  -d '{"versionId":1,"cueRef":2,"reason":"设备不可用","items":[{"cueRef":2,"rowVersion":1},{"cueRef":4,"rowVersion":1},{"cueRef":5,"rowVersion":1},{"cueRef":6,"rowVersion":1}]}' &
+curl -b sm.jar -X POST http://localhost:3002/api/registrations/corrections -H 'Content-Type: application/json' \
+  -d '{"versionId":1,"cueRef":6,"rowVersion":1,"field":"estimated_end","estimatedEndText":"19:25","reason":"现场更正"}' &
+wait
+```
+
+- **跳过先提交**：跳过 `200`（回执 `version` 中 S1/S2/L2/L3 均为 `SKIPPED`，新跳过项行版本 +1）；更正排队后 → `409 CUE_SKIPPED`（或行版本先变时 `VERSION_CONFLICT`），不写更正历史。
+- **更先提交**：更正 `200`；跳过链排队后复核发现链中行版本已推进 → `409 VERSION_CONFLICT`，响应逐项列出过期行，**不标记任何一项跳过、不清除预计结束、不留 skip 记录**。
+
+### 4. 资源告警随回执对应本次提交
+
+两个实例并发登记**不同提示项**（各自占用同一共享资源，如道具 P1 与灯光 L3 都使用容量 1 的「升降台」）：
+
+```bash
+curl -b prop.jar  -X POST http://localhost:3002/api/registrations -H 'Content-Type: application/json' \
+  -d '{"versionId":1,"cueRef":3,"rowVersion":1,"action":"start","time":"19:05"}' &
+curl -b light.jar -X POST http://localhost:3001/api/registrations -H 'Content-Type: application/json' \
+  -d '{"versionId":1,"cueRef":6,"rowVersion":1,"action":"start","time":"19:06"}' &
+wait
+```
+
+先提交者回执 `version.resourceAlerts` 为空（仅一方占用，未超额）；后提交者回执恰好含 1 条「升降台」超额告警，`cues` 同时列出 P1 与 L3——**先到回执不会因后到提交而多出告警**。两者都完成后，按既有规则「仅已完成项构成的超额不告警」，完成回执 `resourceAlerts` 恢复为空。
+
+### 5. 失败回滚不留痕的可观察校验
+
+任一并发失败后，对当前执行版 `GET /api/live` 与 `GET /api/live/change-notices`：
+
+- 失败方操作的提示项行版本不变、登记字段不变；
+- `registration_corrections` / `registration_skips` / `release_signoffs(active=0)` / `schedule_change_notices` 中**没有**失败事务产生的任何记录（成功方事务按规则应产生的顺延待确认记录除外）；
+- 停排失败时 `GET /api/live/interruptions` 无新增段，未开始项预计结束未被清除。
+
+### 6. 错误码一览（并发场景下保持不变）
+
+| 场景 | 状态码 / error |
+| --- | --- |
+| 持旧登记行版本提交登记 / 更正 / 跳过链 | `409 VERSION_CONFLICT`（附 `currentRowVersion` / 逐项 `items`） |
+| 操作的版本已被新版替代 | `409 VERSION_ARCHIVED` / `VERSION_STALE` |
+| 停排期间登记 / 签认 | `409 INTERRUPTION_ACTIVE` |
+| 重复停排 / 重复恢复 | `409 INTERRUPTION_EXISTS` / `NO_ACTIVE_INTERRUPTION` |
+| 停排 / 恢复时刻覆盖已登记实际时刻或不递增 | `400 INTERRUPTION_TIME_CONFLICT` / `INTERRUPTION_TIME_INVALID` |
+| 跳过链中项已有实际开始 / 完成 | `409 SKIP_BLOCKED`；提交链与当前闭包不一致 `400 CHAIN_MISMATCH` |
+| 待确认记录版本过期 / 已确认 / 版本归档 / 非本岗位 | `409 NOTICE_STALE` / `NOTICE_ALREADY_ACKNOWLEDGED` / `NOTICE_VERSION_ARCHIVED` / `403 NOTICE_FORBIDDEN_POSITION` |
+| 写锁等待超过 `busy_timeout`（极端情况） | `500 INTERNAL`（现场写事务为毫秒级，正常部署不会出现；客户端可按 5xx 重试） |
+
+HTTP 接口字段、成功响应结构与既有错误码均未变化；前端无需为并发改造。
